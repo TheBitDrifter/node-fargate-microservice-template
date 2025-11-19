@@ -1,0 +1,192 @@
+name: Deploy Microservice
+run-name: Deploy ${{ vars.SERVICE_ALIAS }} to ${{ inputs.environment }} by @${{ github.actor }} to Fargate
+
+on:
+  # Allows manual triggering from the GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual deployment"
+        required: false
+        default: "Manual trigger via GitHub UI"
+      environment:
+        description: "Deployment Environment"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - prod
+
+permissions:
+  id-token: write # CRITICAL: Allows the job to fetch the OIDC token for AWS authentication
+  contents: read # Allows the job to checkout the code
+
+# --- GLOBAL ENVIRONMENT VARIABLES (PUBLIC CONFIGURATION) ---
+env:
+  # Values pulled from GitHub Repository Variables (Public configuration)
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  SERVICE_ALIAS: ${{ vars.SERVICE_ALIAS }}
+  S3_STATE_BUCKET_NAME: ${{ vars.S3_STATE_BUCKET_NAME }}
+  DYNAMODB_LOCK_TABLE: ${{ vars.DYNAMODB_LOCK_TABLE }}
+
+  # Static path variables
+  TERRAFORM_DIR: "./terraform"
+
+jobs:
+  provision_ecr:
+    name: Provision ECR Repo
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      ecr_repository_url: ${{ steps.get-ecr-url.outputs.ecr_url }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS Credentials (OIDC Login)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-provision-ecr-${{ github.sha }}
+
+      - name: Terraform Init
+        run: |
+          TERRAFORM_KEY="services/${{ inputs.environment }}/${{ env.SERVICE_ALIAS }}.tfstate"
+          terraform init \
+            -backend-config="bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -backend-config="dynamodb_table=${{ env.DYNAMODB_LOCK_TABLE }}" \
+            -backend-config="key=$TERRAFORM_KEY"
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - name: Terraform Apply (Provision Infrastructure)
+        run: |
+          # Apply with placeholder image to provision ECR and basic infrastructure
+          # For staging: creates ECR repository
+          # For prod: looks up existing ECR repository
+          # Uses placeholder image since we haven't built it yet
+          terraform apply -auto-approve \
+            -var="service_name=${{ env.SERVICE_ALIAS }}" \
+            -var="image_url=placeholder" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="platform_state_bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -var="environment=${{ inputs.environment }}"
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - name: Get ECR URL
+        id: get-ecr-url
+        run: |
+          ECR_URL=$(terraform output -raw ecr_repository_url)
+          echo "ecr_url=$ECR_URL" >> $GITHUB_OUTPUT
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+  build_and_push:
+    name: Build & Push Docker Image
+    needs: provision_ecr
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tagger.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Set up the Docker Buildx builder (Required for caching with type=gha)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      # Set a unique, immutable tag based on the Git SHA
+      - name: Set Image Tag
+        id: tagger
+        run: |
+          echo "image_tag=$GITHUB_SHA" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials (OIDC Login)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }} # Must remain a Secret
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-build-push-${{ github.sha }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check if image exists
+        id: check-image
+        env:
+          ECR_URL: ${{ needs.provision_ecr.outputs.ecr_repository_url }}
+          IMAGE_TAG: ${{ steps.tagger.outputs.image_tag }}
+        run: |
+          # Extract repository name from URL (everything after the first /)
+          REPO_NAME=${ECR_URL#*/}
+          echo "Checking for image $REPO_NAME:$IMAGE_TAG..."
+          if aws ecr describe-images --repository-name $REPO_NAME --image-ids imageTag=$IMAGE_TAG > /dev/null 2>&1; then
+            echo "Image found! Skipping build and push."
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Image not found. Proceeding with build."
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and Push Docker Image
+        if: steps.check-image.outputs.exists != 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ needs.provision_ecr.outputs.ecr_repository_url }}:${{ steps.tagger.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy_terraform:
+    name: Deploy Infrastructure
+    needs: [provision_ecr, build_and_push]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS Credentials (OIDC Login)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }} # Must remain a Secret
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-deploy-tf-${{ github.sha }}
+
+      - name: Terraform Init
+        run: |
+          # 1. Calculate the dynamic key path using the short SERVICE_ALIAS
+          TERRAFORM_KEY="services/${{ inputs.environment }}/${{ env.SERVICE_ALIAS }}.tfstate"
+
+          # 2. Inject all state backend configuration from Repository Variables
+          terraform init \
+            -backend-config="bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -backend-config="dynamodb_table=${{ env.DYNAMODB_LOCK_TABLE }}" \
+            -backend-config="key=$TERRAFORM_KEY"
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - name: Terraform Apply
+        run: |
+          # Pass the short SERVICE_ALIAS as the service_name variable to comply with AWS limits
+          terraform apply -auto-approve \
+            -var="service_name=${{ env.SERVICE_ALIAS }}" \
+            -var="image_url=${{ needs.provision_ecr.outputs.ecr_repository_url }}:${{ needs.build_and_push.outputs.image_tag }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="platform_state_bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -var="environment=${{ inputs.environment }}"
+        working-directory: ${{ env.TERRAFORM_DIR }}

@@ -1,0 +1,91 @@
+name: Destroy Microservice Infrastructure
+run-name: Destroy ${{ vars.SERVICE_ALIAS }} in ${{ inputs.environment }} by @${{ github.actor }}
+
+on:
+  # Workflow is restricted to manual triggering to prevent accidental execution.
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Confirmation required to execute. Type 'DESTROY'."
+        required: true
+        default: ""
+      environment:
+        description: "Environment to destroy"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - prod
+      reason:
+        description: "Reason for manual destroy"
+        required: false
+        default: "Manual trigger via GitHub UI"
+
+permissions:
+  id-token: write # Required to obtain the OIDC token for AWS authentication.
+  contents: read # Required to checkout the repository code.
+
+# --- Configuration ---
+env:
+  # Infrastructure configuration sourced from GitHub Repository Variables.
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  SERVICE_ALIAS: ${{ vars.SERVICE_ALIAS }}
+  S3_STATE_BUCKET_NAME: ${{ vars.S3_STATE_BUCKET_NAME }}
+  DYNAMODB_LOCK_TABLE: ${{ vars.DYNAMODB_LOCK_TABLE }}
+
+  # Project directory definitions.
+  TERRAFORM_DIR: "./terraform"
+
+jobs:
+  destroy_infrastructure:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      # Validation step to ensure the user explicitly intended to destroy resources.
+      - name: Validate Execution Intent
+        run: |
+          if [ "${{ inputs.confirmation }}" != "DESTROY" ]; then
+            echo "Error: Execution aborted. Input 'DESTROY' is required to proceed."
+            exit 1
+          fi
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-destroy-tf-${{ github.sha }}
+
+      - name: Initialize Terraform Backend
+        run: |
+          # Construct the dynamic path to the Terraform state file based on the service alias.
+          TERRAFORM_KEY="services/${{ inputs.environment }}/${{ env.SERVICE_ALIAS }}.tfstate"
+
+          # Initialize the backend with dynamic configuration variables.
+          terraform init \
+            -backend-config="bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -backend-config="dynamodb_table=${{ env.DYNAMODB_LOCK_TABLE }}" \
+            -backend-config="key=$TERRAFORM_KEY"
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - name: Execute Terraform Destroy
+        run: |
+          # Execute the destroy command. 
+          # Note: Placeholder values are provided for mandatory variables (e.g., image_url) 
+          # to satisfy Terraform input validation during the plan/destroy phase.
+          terraform destroy -auto-approve \
+            -var="service_name=${{ env.SERVICE_ALIAS }}" \
+            -var="environment=${{ inputs.environment }}" \
+            -var="image_url=placeholder" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="platform_state_bucket=${{ env.S3_STATE_BUCKET_NAME }}"
+        working-directory: ${{ env.TERRAFORM_DIR }}

@@ -1,0 +1,16 @@
+# Dependencies
+/node_modules
+
+# Compiled Files
+/dist
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.log
+
+# IDE and OS files
+.DS_Store
+.vscode
+
