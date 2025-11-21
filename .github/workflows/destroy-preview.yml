@@ -1,0 +1,79 @@
+name: Destroy Preview Environment
+run-name: Destroy Preview ${{ inputs.branch_name }} by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: "Branch name to destroy (e.g., feature/login)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  S3_STATE_BUCKET_NAME: ${{ vars.S3_STATE_BUCKET_NAME }}
+  DYNAMODB_LOCK_TABLE: ${{ vars.DYNAMODB_LOCK_TABLE }}
+  BASE_SERVICE_ALIAS: ${{ vars.SERVICE_ALIAS }}
+  TERRAFORM_DIR: "./terraform"
+  PLATFORM_ENV: "dev"
+
+jobs:
+  destroy_preview:
+    name: Destroy Preview
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Sanitize Branch Name
+        id: meta
+        run: |
+          # Sanitize branch name to be URL/Resource safe (lowercase, alphanumeric, hyphens)
+          # e.g. "feature/login-page" -> "feature-login-page"
+          SAFE_BRANCH=$(echo "${{ inputs.branch_name }}" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+          
+          # Create the Service Alias
+          SERVICE_ALIAS="preview-${SAFE_BRANCH}"
+          
+          # Truncate to avoid AWS limits (32 chars max for some resources, keeping it safe)
+          # "preview-" is 8 chars, so we have ~24 chars for branch name
+          SERVICE_ALIAS=${SERVICE_ALIAS:0:30}
+          
+          echo "service_alias=$SERVICE_ALIAS" >> $GITHUB_OUTPUT
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-destroy-preview-${{ github.sha }}
+
+      - name: Terraform Init
+        run: |
+          TERRAFORM_KEY="services/preview/${{ steps.meta.outputs.service_alias }}.tfstate"
+          
+          terraform init \
+            -backend-config="bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -backend-config="dynamodb_table=${{ env.DYNAMODB_LOCK_TABLE }}" \
+            -backend-config="key=$TERRAFORM_KEY"
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - name: Terraform Destroy
+        run: |
+          terraform destroy -auto-approve \
+            -var="service_name=${{ steps.meta.outputs.service_alias }}" \
+            -var="ecr_repository_name=${{ env.BASE_SERVICE_ALIAS }}" \
+            -var="image_url=placeholder" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="platform_state_bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -var="environment=${{ env.PLATFORM_ENV }}"
+        working-directory: ${{ env.TERRAFORM_DIR }}

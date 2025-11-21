@@ -47,13 +47,15 @@ module "service" {
   # source = "../../terraform-aws-fargate-service"
 
   # SERVICE DETAILS 
-  service_name   = var.service_name
-  environment    = var.environment
-  create_ecr     = var.environment == "staging"
-  aws_region     = var.aws_region
-  image_url      = var.image_url # CRITICAL: Injected by CI/CD
-  container_port = 3000
-  desired_count  = var.desired_count
+  service_name        = var.service_name
+  environment         = var.environment # ECR Logic
+  # Only create ECR if we are in dev AND we are the owner (service_name matches repo name)
+  create_ecr          = var.environment == "dev" && var.service_name == coalesce(var.ecr_repository_name, var.service_name)
+  ecr_repository_name = var.ecr_repository_name
+  aws_region          = var.aws_region
+  image_url           = var.image_url # CRITICAL: Injected by CI/CD
+  container_port      = 3000
+  desired_count       = var.desired_count
 
   # AUTO SCALING
   min_capacity     = 1

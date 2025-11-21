@@ -59,12 +59,12 @@ This template supports multi-environment deployments (`staging`, `prod`):
 *   **State Isolation**: Each environment stores its state at `services/<environment>/<service>.tfstate`.
 *   **Resource Naming**: Resources include the environment suffix (e.g., `user-api-staging-ecs-service`).
 *   **Shared ECR**: The ECR repository is **shared** across environments:
-    *   **Staging** creates the repository.
-    *   **Prod** reads the existing repository.
+    *   **Dev** is the **Owner** (creates the repository).
+    *   **Staging/Prod** are **Consumers** (read the existing repository).
     *   This follows the "Build Once, Deploy Anywhere" principle.
 
 > [!WARNING]
-> **Destruction Risk**: If you destroy the **staging** environment, the ECR repository (and all images) will be deleted, affecting prod.
+> **Destruction Risk**: If you destroy the **dev** environment (the Owner), the ECR repository (and all images) will be deleted, affecting all other environments.
 
 ### 2.4 Deployment Flow
 
@@ -90,8 +90,8 @@ graph TD
 ```
 
 **When deploying:**
-1.  Select the target **environment** (`staging` or `prod`).
-2.  **Provision ECR:** Terraform ensures the ECR repository exists (creates if staging, looks up if prod).
+1.  Select the target **environment** (`dev`, `staging`, or `prod`).
+2.  **Provision ECR:** Terraform ensures the ECR repository exists (creates if dev, looks up others).
 3.  **Build & Push:** Checks if the image (tagged with Git SHA) exists. If not, builds and pushes it.
 4.  **Deploy:** Terraform updates the ECS Service to use the new image tag.
 

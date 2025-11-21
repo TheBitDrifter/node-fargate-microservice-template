@@ -1,0 +1,116 @@
+name: Deploy Preview Environment
+run-name: Preview ${{ github.ref_name }} (Expires in ${{ inputs.expiry_days }} days) by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      expiry_days:
+        description: "Days until expiry (Max 14)"
+        required: true
+        default: "1"
+        type: number
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # Global Config
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  S3_STATE_BUCKET_NAME: ${{ vars.S3_STATE_BUCKET_NAME }}
+  DYNAMODB_LOCK_TABLE: ${{ vars.DYNAMODB_LOCK_TABLE }}
+  BASE_SERVICE_ALIAS: ${{ vars.SERVICE_ALIAS }} # The shared ECR repo name
+  TERRAFORM_DIR: "./terraform"
+  
+  # Preview Config
+  PLATFORM_ENV: "dev" 
+
+jobs:
+  deploy_preview:
+    name: Deploy Preview
+    runs-on: ubuntu-latest
+    environment: dev # Uses dev secrets/vars
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Sanitize Branch Name
+        id: meta
+        run: |
+          SAFE_BRANCH=$(echo "${{ github.ref_name }}" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+          SERVICE_ALIAS="preview-${SAFE_BRANCH}"
+          SERVICE_ALIAS=${SERVICE_ALIAS:0:30}
+          
+          echo "service_alias=$SERVICE_ALIAS" >> $GITHUB_OUTPUT
+          
+          # Use the Git SHA as the image tag
+          echo "image_tag=$GITHUB_SHA" >> $GITHUB_OUTPUT
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-preview-${{ github.sha }}
+
+      # --- BUILD AND PUSH ---
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get ECR Repository URL
+        id: get-ecr
+        run: |
+          # We assume the ECR repo exists and is named after the BASE_SERVICE_ALIAS (e.g. user-api)
+          # The registry output is the full URI (e.g. 123.dkr.ecr.region.amazonaws.com)
+          REGISTRY_URI=${{ steps.login-ecr.outputs.registry }}
+          ECR_URL="$REGISTRY_URI/${{ env.BASE_SERVICE_ALIAS }}"
+          echo "ecr_url=$ECR_URL" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.get-ecr.outputs.ecr_url }}:${{ steps.meta.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --- DEPLOY ---
+      - name: Terraform Init
+        run: |
+          TERRAFORM_KEY="services/preview/${{ steps.meta.outputs.service_alias }}.tfstate"
+          
+          terraform init \
+            -backend-config="bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -backend-config="dynamodb_table=${{ env.DYNAMODB_LOCK_TABLE }}" \
+            -backend-config="key=$TERRAFORM_KEY"
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - name: Terraform Apply
+        run: |
+          # We pass ecr_repository_name so the module looks up the correct repo
+          # We pass image_url pointing to the image we just pushed
+          
+          terraform apply -auto-approve \
+            -var="service_name=${{ steps.meta.outputs.service_alias }}" \
+            -var="ecr_repository_name=${{ env.BASE_SERVICE_ALIAS }}" \
+            -var="image_url=${{ steps.get-ecr.outputs.ecr_url }}:${{ steps.meta.outputs.image_tag }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="platform_state_bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -var="environment=${{ env.PLATFORM_ENV }}" \
+            -var="desired_count=1" 
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        
+      - name: Tag Resources for Expiry
+        if: success()
+        run: |
+          EXPIRY_DATE=$(date -d "+${{ inputs.expiry_days }} days" +%Y-%m-%d)
+          echo "Setting Expiry Tag to $EXPIRY_DATE"

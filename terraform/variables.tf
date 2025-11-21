@@ -14,6 +14,12 @@ variable "service_name" {
   type        = string
 }
 
+variable "ecr_repository_name" {
+  description = "Name of the ECR repository. Defaults to service_name if not provided."
+  type        = string
+  default     = null
+}
+
 variable "image_url" {
   description = "The ECR URL of the built Docker image. Supplied by the CI/CD pipeline."
   type        = string
